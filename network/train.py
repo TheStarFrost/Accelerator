@@ -11,7 +11,7 @@ import h5py
 import os
 from tqdm import tqdm
 
-from netmodel_v3 import NeuroImagingNet
+from netmodel import NeuroImagingNet
 
 matplotlib.use("Agg")  # 设置为无头模式
 
@@ -295,78 +295,49 @@ def train_reconstruction(projections, images, val_ratio=0.2):
 
 # 测试示例（假设已有数据）
 if __name__ == "__main__":
-    # 导入训练数据
+
+    # 加载设置
+    torch.backends.cudnn.benchmark = True  # 加速卷积运算
+    torch.cuda.empty_cache()  # 清空缓存
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "expandable_segments:True"  # 防显存碎片
+    )
+
+    # 数据导入
+    data_dir = "./data"  # 数据文件所在目录
     all_projections = []
     all_images = []
 
-    # 假设文件命名是连续的：data0.mat, data1.mat, data2.mat...
-    data_dir = "./data"  # 数据文件所在目录
-    i = 0
+    if not os.path.exists(data_dir):
+        print(f"目录 {data_dir} 不存在")
+    else:
+        mat_files = [f for f in os.listdir(data_dir) if f.endswith(".mat")]
 
-    while True:
-        filename = os.path.join(data_dir, f"data_img{i}.mat")
+        if not mat_files:
+            print(f"在 {data_dir} 中未找到.mat文件")
+        else:
+            mat_files.sort()  # 顺序处理
+            for filename in mat_files:
+                file_path = os.path.join(data_dir, filename)
+                try:
+                    with h5py.File(file_path, "r") as file:
+                        # 读取并转置 projections
+                        a_projections = file["all_proj"][()]
+                        a_projections = np.transpose(a_projections, (2, 1, 0))
+                        all_projections.append(a_projections)
 
-        # 检查文件是否存在
-        if not os.path.exists(filename):
-            print(f"file {filename} donot exist，stop reading")
-            break
+                        # 读取并转置 images
+                        a_images = file["all_imgs"][()]
+                        a_images = np.transpose(a_images, (2, 1, 0))
+                        all_images.append(a_images)
 
-        # 读取当前文件
-        with h5py.File(filename, "r") as file:
-            # 读取并转置 projections
-            a_projections = file["all_proj"][()]
-            a_projections = np.transpose(a_projections, (2, 1, 0))
-            all_projections.append(a_projections)
+                    print(
+                        f"已加载 {len(a_projections)} 个样本，来自文件 {filename}"
+                    )
 
-            # 读取并转置 images
-            a_images = file["all_imgs"][()]
-            a_images = np.transpose(a_images, (2, 1, 0))
-            all_images.append(a_images)
-
-        print(f"loaded {len(a_projections)} samples in {filename} ")
-        i += 1  # 递增索引，读取下一个文件
-
-    # #自动读取data文件夹下所有.mat文件
-    # data_dir = "./data"  # 数据文件所在目录
-    # all_projections = []
-    # all_images = []
-
-    # # 确保目录存在
-    # if not os.path.exists(data_dir):
-    #     print(f"目录 {data_dir} 不存在")
-    # else:
-    #     # 获取所有.mat文件
-    #     mat_files = [f for f in os.listdir(data_dir) if f.endswith('.mat')]
-
-    #     if not mat_files:
-    #         print(f"在 {data_dir} 中未找到.mat文件")
-    #     else:
-    #         # 排序文件名，确保按顺序处理
-    #         mat_files.sort()
-
-    #         # 遍历每个文件
-    #         for filename in mat_files:
-    #             file_path = os.path.join(data_dir, filename)
-
-    #             try:
-    #                 # 读取当前文件
-    #                 with h5py.File(file_path, "r") as file:
-    #                     # 读取并转置 projections
-    #                     a_projections = file["all_proj"][()]
-    #                     a_projections = np.transpose(a_projections, (2, 1, 0))
-    #                     all_projections.append(a_projections)
-
-    #                     # 读取并转置 images
-    #                     a_images = file["all_imgs"][()]
-    #                     a_images = np.transpose(a_images, (2, 1, 0))
-    #                     all_images.append(a_images)
-
-    #                 print(f"已加载 {len(a_projections)} 个样本，来自文件 {filename}")
-
-    #             except Exception as e:
-    #                 print(f"读取文件 {filename} 时出错: {str(e)}")
-    #                 continue
-
+                except Exception as e:
+                    print(f"读取文件 {filename} 时出错: {str(e)}")
+                    continue
     # 合并所有数据
     if all_projections:
         # 沿第一个维度（axis=0）合并
@@ -379,14 +350,8 @@ if __name__ == "__main__":
     else:
         print("no files found")
 
-    # 运行训练
+    # 训练
     print("Starting training...")
-    # 显存优化配置
-    torch.backends.cudnn.benchmark = True  # 加速卷积运算
-    torch.cuda.empty_cache()  # 清空缓存
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-        "expandable_segments:True"  # 防显存碎片
-    )
     trained_model = train_reconstruction(projections, images)
 
     # 无头模式存储可视化

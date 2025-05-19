@@ -169,28 +169,23 @@ def train_reconstruction(projections, images, val_ratio=0.2):
     no_improve = 0
     epochs = 256  # 设置总epochs数
 
-    # 使用tqdm创建进度条
-    with tqdm(
-        range(epochs),
-        desc="Training Progress",
-        unit="epoch",
-        dynamic_ncols=False,
-    ) as pbar:
-        for epoch in pbar:
+    # 使用tqdm创建主进度条
 
+    with tqdm(range(epochs), desc="Training Progress", unit="epoch") as pbar:
+        for epoch in pbar:
             # 训练阶段
             model.train()
             train_loss = 0.0
 
-            # 添加训练批次进度条
-            train_batches = tqdm(
-                train_loader,
-                desc=f"Epoch {epoch + 1}/{epochs}",
-                leave=False,
-                unit="batch",
-            )
-
-            for i, (proj, img) in enumerate(train_loader):
+            # 添加训练批次进度条 - 注意leave=False确保它不会保留
+            for i, (proj, img) in enumerate(
+                tqdm(
+                    train_loader,
+                    desc=f"Train - Epoch {epoch + 1}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                )
+            ):
                 proj, img = proj.to(device), img.to(device)
 
                 optimizer.zero_grad()
@@ -202,30 +197,21 @@ def train_reconstruction(projections, images, val_ratio=0.2):
 
                 train_loss += loss.item() * proj.size(0)
 
-                # 更新批次进度条
-                train_batches.set_postfix(loss=loss.item())
-
             # 验证阶段
             model.eval()
             val_loss = 0.0
 
-            # 添加验证批次进度条
-            val_batches = tqdm(
-                val_loader, desc="Validating", leave=False, unit="batch"
-            )
-
             with torch.no_grad():
-                for proj, img in val_loader:
+                for proj, img in tqdm(
+                    val_loader,
+                    desc=f"Valid - Epoch {epoch + 1}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                ):
                     proj, img = proj.to(device), img.to(device)
                     output = model(proj)
-                    val_loss += criterion(output, img).item() * proj.size(0)
-
-                    # 更新验证批次进度条
-                    val_batches.set_postfix(loss=loss.item())
-
-            # 关闭批次进度条
-            train_batches.close()
-            val_batches.close()
+                    batch_loss = criterion(output, img).item()
+                    val_loss += batch_loss * proj.size(0)
 
             # 计算平均损失
             train_loss /= len(train_set)
@@ -237,15 +223,15 @@ def train_reconstruction(projections, images, val_ratio=0.2):
             # 记录损失和学习率
             train_losses.append(train_loss)
             val_losses.append(val_loss)
-            learning_rates.append(optimizer.param_groups[0]["lr"])  # 当前学习率
+            learning_rates.append(optimizer.param_groups[0]["lr"])
 
             # 更新主进度条
             pbar.set_postfix(
                 {
-                    "Train Loss": f"{train_loss:.4f}",
-                    "Val Loss": f"{val_loss:.4f}",
-                    "Best Val Loss": f"{best_loss:.4f}",
-                    "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    "t_loss": f"{train_loss:.4f}",
+                    "v_loss": f"{val_loss:.4f}",
+                    "best": f"{best_loss:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
             )
 
@@ -254,18 +240,12 @@ def train_reconstruction(projections, images, val_ratio=0.2):
                 best_loss = val_loss
                 torch.save(model.state_dict(), "model_peremeter.pth")
                 no_improve = 0
-                pbar.set_description(
-                    f"Training Progress (Best Epoch: {epoch + 1})"
-                )
+                pbar.set_description(f"Training Progress (Best: {epoch + 1})")
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"Early stopping at epoch {epoch + 1}")
+                    pbar.write(f"Early stopping at epoch {epoch + 1}")
                     break
-
-            print(
-                f"Epoch {epoch + 1:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
-            )
 
     plt.figure(figsize=(12, 5))
 

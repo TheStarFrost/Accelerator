@@ -8,11 +8,18 @@ import math
 class NeuroImagingNet(nn.Module):
     """端到端神经影像重建网络"""
 
-    def __init__(self):
+    def __init__(
+        self, enhanced=False, temporal_mode="pooled", source_timestep=None
+    ):
         super().__init__()
+        self.enhanced = enhanced
+        self.temporal_mode = temporal_mode
+        self.source_timestep = source_timestep
 
         # 时序编码模块
-        self.temporal_encoder = TemporalEncoder()
+        self.temporal_encoder = TemporalEncoder(
+            enhanced=enhanced, output_mode=temporal_mode
+        )
 
         # 空间解码模块
         self.spatial_decoder = SpatialDecoder()
@@ -32,15 +39,32 @@ class NeuroImagingNet(nn.Module):
         # 时序特征提取 [B, 128, 128] → [B, 2048]
         features = self.temporal_encoder(x)
 
-        # 空间重建 [B, 2048] → [B, 128, 128]
-        return self.spatial_decoder(features)
+        if self.temporal_mode == "pooled":
+            # 原聚合模式：单一输出 [B, 2048] → [B, 128, 128]
+            return self.spatial_decoder(features)
+        else:
+            # 序列模式：为每个时间步生成输出 [B, T, 2048]
+            B, T, D = features.shape
+            seq_outputs = []
+
+            # 对每个时间步进行解码
+            for t in range(T):
+                t_features = features[:, t, :]
+                t_output = self.spatial_decoder(t_features)  # [B, 128, 128]
+                seq_outputs.append(t_output.unsqueeze(1))
+
+            # 组合所有时间步的输出 [B, T, 128, 128]
+            return torch.cat(seq_outputs, dim=1)
 
 
 class TemporalEncoder(nn.Module):
     """时序特征提取器"""
 
-    def __init__(self):
+    def __init__(self, enhanced=False, output_mode="pooled"):
         super().__init__()
+
+        self.enhanced = enhanced
+        self.output_mode = output_mode
 
         # 位置编码生成器
         self.pos_encoder = PositionalEncoder()
@@ -53,7 +77,12 @@ class TemporalEncoder(nn.Module):
         )
 
         # 时序聚合层
-        self.temporal_pool = TemporalAggregator()
+        if enhanced:
+            self.temporal_pool = EnhancedTemporalAggregator(
+                output_mode=output_mode
+            )
+        else:
+            self.temporal_pool = TemporalAggregator()
 
     def forward(self, x):
         """时序处理流程"""
@@ -137,9 +166,109 @@ class TemporalAggregator(nn.Module):
 
     def forward(self, x):
         """注意力加权池化"""
+        # 将简单地聚合全部时间上的特征,改为对每一时间,聚合周围时间的特征,聚合的因子由注意力机制提供,使得能够保持[B,T,D]的输出
         attn_weights = self.attention(x)  # [B, T, 1]
         pooled = torch.sum(x * attn_weights, dim=1)  # [B, D]
         return self.dropout(self.post_norm(pooled))
+
+
+class EnhancedTemporalAggregator(nn.Module):
+    """增强型时序聚合器"""
+
+    def __init__(self, input_dim=2048, hidden_dim=1024, output_mode="pooled"):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_mode = output_mode  # 'pooled'或'sequence' pooled为原模式,即直接进行时间步聚合,sequence下为对每个时间步都进行注意力思考与输出
+
+        # 基础注意力模块 特征压缩
+        self.query_proj = nn.Linear(input_dim, hidden_dim)
+        self.key_proj = nn.Linear(input_dim, hidden_dim)
+        self.value_proj = nn.Linear(input_dim, hidden_dim)
+
+        # 注意力投影网络 - 用于在时间步之间传递注意力模式
+        self.attn_projection = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # 输出处理
+        self.output_proj = nn.Linear(hidden_dim, input_dim)
+        self.layer_norm = nn.LayerNorm(input_dim)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x, source_timestep=None):
+        """
+        增强型时序注意力聚合
+        Args:
+            x: 输入特征 [B, T, D]
+            source_timestep: 源时间步索引，None表示使用所有时间步的平均注意力
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # 计算查询、键、值
+        queries = self.query_proj(x)  # [B, T, H]
+        keys = self.key_proj(x)  # [B, T, H]
+        values = self.value_proj(x)  # [B, T, H]
+
+        # 计算注意力权重（未归一化）
+        attention_scores = torch.bmm(queries, keys.transpose(1, 2))  # [B, T, T]
+        attention_scores = attention_scores / math.sqrt(self.hidden_dim)
+
+        # 指定单步模式
+        if source_timestep is not None:
+            # 从特定时间步学习注意力
+            source_feats = x[:, source_timestep, :].unsqueeze(1)  # [B, 1, D]
+
+            # 生成投影注意力
+            projected_attns = []
+
+            for t in range(seq_len):
+                # 目标时间步特征
+                target_feats = x[:, t, :].unsqueeze(1)  # [B, 1, D]
+
+                # 源时间步和目标时间步特征的组合
+                combined = torch.cat(
+                    [source_feats, target_feats], dim=-1
+                )  # [B, 1, 2D]
+
+                # 投影：学习从源时间步到目标时间步的注意力模式
+                proj_query = self.attn_projection(combined)  # [B, 1, H]
+
+                # 用投影查询计算与所有时间步的注意力分数
+                proj_scores = torch.bmm(
+                    proj_query, keys.transpose(1, 2)
+                )  # [B, 1, T]
+                proj_scores = proj_scores / math.sqrt(self.hidden_dim)
+
+                # 归一化
+                proj_weights = torch.softmax(proj_scores, dim=-1)  # [B, 1, T]
+                projected_attns.append(proj_weights)
+
+            # 组合所有投影注意力 [B, T, T]
+            attention_weights = torch.cat(projected_attns, dim=1)
+        else:
+            # 使用标准注意力
+            attention_weights = torch.softmax(
+                attention_scores, dim=-1
+            )  # [B, T, T]
+
+        # 应用注意力权重
+        context_vectors = torch.bmm(attention_weights, values)  # [B, T, H]
+
+        # 输出投影
+        output = self.output_proj(context_vectors)  # [B, T, D]
+        output = self.dropout(self.layer_norm(output + x))  # 残差连接
+
+        if self.output_mode == "pooled":
+            # 如果需要聚合输出
+            pooled = output.mean(dim=1)  # [B, D]
+            return pooled
+        else:
+            # 返回完整的时序序列
+            return output
 
 
 class SpatialDecoder(nn.Module):

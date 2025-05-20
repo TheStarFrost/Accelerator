@@ -126,7 +126,14 @@ class ReconLoss(nn.Module):
 
 
 # 完整训练流程
-def train_reconstruction(projections, images, val_ratio=0.2):
+def train_reconstruction(
+    projections,
+    images,
+    enhanced=False,
+    temporal_model="pooled",
+    batch_size=64,
+    val_ratio=0.2,
+):
     # 划分训练验证集
     dataset_size = len(projections)
     # np.random.seed(88)
@@ -142,14 +149,24 @@ def train_reconstruction(projections, images, val_ratio=0.2):
 
     # 创建数据加载器
     train_loader = data.DataLoader(
-        train_set, batch_size=128, shuffle=True, num_workers=16, pin_memory=True
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=16,
+        pin_memory=True,
     )
     val_loader = data.DataLoader(
-        val_set, batch_size=128, shuffle=False, num_workers=16, pin_memory=True
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
     )
 
     # 初始化模型和优化器
-    model = NeuroImagingNet().to(device)
+    model = NeuroImagingNet(enhanced=enhanced, temporal_mode=temporal_model).to(
+        device
+    )
     criterion = ReconLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=1e-4, weight_decay=1e-5
@@ -282,6 +299,9 @@ if __name__ == "__main__":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
         "expandable_segments:True"  # 防显存碎片
     )
+    enhanced = True  # 是否增强
+    temporal_model = "pooled"  # 是否聚合 pooled/seq
+    batch_size = 128
 
     # 数据导入
     data_dir = "./data"  # 数据文件所在目录
@@ -332,7 +352,13 @@ if __name__ == "__main__":
 
     # 训练
     print("Starting training...")
-    trained_model = train_reconstruction(projections, images)
+    trained_model = train_reconstruction(
+        projections,
+        images,
+        enhanced=enhanced,
+        temporal_model=temporal_model,
+        batch_size=batch_size,
+    )
 
     # 无头模式存储可视化
     print("\nGenerating output images...")

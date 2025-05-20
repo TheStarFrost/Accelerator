@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import math
+from tqdm import tqdm
 
 
 class NeuroImagingNet(nn.Module):
@@ -92,7 +93,7 @@ class TemporalEncoder(nn.Module):
         # 特征扩展 [B, 128, 192] → [B, 128, 2048]
         x = self.feature_mlp(x)
 
-        # 时序聚合 [B, 128, 2048] → [B, 2048]
+        # 时序聚合 [B, 128, 2048] → [B, 2048]/[B, 128, 2048]
         return self.temporal_pool(x)
 
 

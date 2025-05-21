@@ -172,7 +172,13 @@ def train_reconstruction(
         model.parameters(), lr=1e-4, weight_decay=1e-5
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+        optimizer,
+        mode="min",
+        factor=0.8,
+        patience=7,
+        threshold=1e-5,
+        min_lr=1e-7,
+        verbose=True,
     )
 
     # 添加记录
@@ -259,7 +265,14 @@ def train_reconstruction(
                 no_improve = 0
                 pbar.set_description(f"Training Progress (Best: {epoch + 1})")
             else:
-                no_improve += 1
+                # 若处于调节冷却期则不进行处理 暂定冷却期为5
+                if (
+                    len(learning_rates) > 5
+                    and learning_rates[-1] != learning_rates[-2]
+                ):
+                    no_improve -= 5
+                else:
+                    no_improve += 1
                 if no_improve >= patience:
                     pbar.write(f"Early stopping at epoch {epoch + 1}")
                     break

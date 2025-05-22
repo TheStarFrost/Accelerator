@@ -347,8 +347,11 @@ if __name__ == "__main__":
     data_dir = "./data"  # 数据文件所在目录
     all_projections = []
     all_images = []
+    slip_data = []
     if args.test:
         slip_data = ["data_real3.mat"]
+    else:
+        slip_data = ["data_img0.mat"]
 
     if not os.path.exists(data_dir):
         print(f"目录 {data_dir} 不存在")
@@ -448,20 +451,20 @@ if __name__ == "__main__":
     # 合并所有数据
     if all_projections:
         # 沿第一个维度（axis=0）合并
-        projections = np.concatenate(all_projections, axis=0)
-        images = np.concatenate(all_images, axis=0)
+        all_projections = np.concatenate(all_projections, axis=0)
+        all_images = np.concatenate(all_images, axis=0)
 
-        print("projections shape:", projections.shape)
-        print("images shape:", images.shape)
-        print(f"total samples: {len(projections)}")
+        print("projections shape:", all_projections.shape)
+        print("images shape:", all_images.shape)
+        print(f"total samples: {len(all_projections)}")
     else:
         print("no files found")
 
     # 训练
     print("Starting training...")
     trained_model = train_reconstruction(
-        projections,
-        images,
+        all_projections,
+        all_images,
         enhanced=enhanced,
         temporal_model=temporal_model,
         batch_size=batch_size,

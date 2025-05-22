@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
+import time
 import torch
 import torch.nn as nn
 import torch.utils.data as data
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torch.nn.functional as F
 import h5py
@@ -89,6 +91,7 @@ class ReconDataset(data.Dataset):
 class ReconLoss(nn.Module):
     def __init__(self, temporal_model="pooled"):
         super().__init__()
+        self.temporal_model = temporal_model
         self.mse = nn.MSELoss()
         self.ssim = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
         self.grad_kernel = torch.tensor(
@@ -97,46 +100,92 @@ class ReconLoss(nn.Module):
 
     def gradient_loss(self, pred, target):
         pred_grad, target_grad = None, None
-        if temporal_model == "pooled":
+        if self.temporal_model == "pooled":
             pred_grad = F.conv2d(
                 pred.unsqueeze(1), self.grad_kernel.to(pred.device)
             )
             target_grad = F.conv2d(
                 target.unsqueeze(1), self.grad_kernel.to(target.device)
             )
+            return F.l1_loss(pred_grad, target_grad)
         else:
             # seq模式 [B,T,H,W]
-            pred_grad = F.conv2d(pred, self.grad_kernel.to(pred.device))
-            target_grad = F.conv2d(target, self.grad_kernel.to(target.device))
-        return F.l1_loss(pred_grad, target_grad)
+            time_steps = pred.size(1)
+            total_loss = 0
+            for t in range(time_steps):
+                pred_grad_t = F.conv2d(
+                    pred[:, t, :, :].unsqueeze(1),
+                    self.grad_kernel.to(pred.device),
+                )
+                target_grad_t = F.conv2d(
+                    target[:, t, :, :].unsqueeze(1),
+                    self.grad_kernel.to(target.device),
+                )
+                total_loss += F.l1_loss(pred_grad_t, target_grad_t)
+            # 时间步平均损失
+            return total_loss / time_steps
 
     def projection_loss(self, pred, target):
         """计算x轴投影的MSE损失（自动归一化）"""
-        if temporal_model == "pooled":
+        if self.temporal_model == "pooled":
             # pooled模式 [B,T,H,W]
             pred_2d = pred.unsqueeze(1)
             target_2d = target.unsqueeze(1)
+
+            # 计算x轴投影（沿高度方向求和）
+            pred_proj = pred_2d.sum(dim=2)  # 形状 [B, 1, W]
+            target_proj = target_2d.sum(dim=2)
+
+            # 计算归一化投影损失
+            proj_loss = F.mse_loss(pred_proj, target_proj)
+            return proj_loss / 1000
+
         else:
             # seq模式 [B,T,H,W]
-            pred_2d = pred
-            target_2d = target
+            time_steps = pred.size(1)
+            total_loss = 0
+            for t in range(time_steps):
+                pred_2d = pred[:, t, :, :].unsqueeze(1)
+                target_2d = target[:, t, :, :].unsqueeze(1)
 
-        # 计算x轴投影（沿高度方向求和）
-        pred_proj = pred_2d.sum(dim=2)  # 形状 [B, 1, W]
-        target_proj = target_2d.sum(dim=2)
+                # 计算x轴投影（沿高度方向求和）
+                pred_proj = pred_2d.sum(dim=2)
+                target_proj = target_2d.sum(dim=2)
+                # 计算归一化投影损失
+                total_loss += F.mse_loss(pred_proj, target_proj)
+            # 时间步平均损失
+            return total_loss / (time_steps * 1000)
 
-        # 计算归一化投影损失
-        proj_loss = F.mse_loss(pred_proj, target_proj)
-        return proj_loss / 1000
+    def ssim_loss_seq(self, pred, target):
+        """计算seq模式下的SSIM损失"""
+        batch_size, timesteps = pred.shape[0], pred.shape[1]
+        total_ssim = 0.0
+
+        # 逐时间步计算SSIM
+        for t in range(timesteps):
+            pred_t = pred[:, t].unsqueeze(1)  # [B,1,H,W]
+            target_t = target[:, t].unsqueeze(1)
+            ssim_t = self.ssim(pred_t, target_t)
+            total_ssim += ssim_t
+
+        # 返回平均SSIM损失
+        return 1 - (total_ssim / timesteps)
 
     def forward(self, pred, target):
+        # 检查输入形状是否符合当前模式
+        if self.temporal_model == "pooled" and pred.dim() != 3:
+            raise ValueError(f"pooled模式期望[B,H,W]输入，但收到: {pred.shape}")
+        if self.temporal_model == "seq" and pred.dim() != 4:
+            raise ValueError(f"seq模式期望[B,T,H,W]输入，但收到: {pred.shape}")
+
+        # 计算损失
         mse_loss = self.mse(pred, target)
-        if temporal_model == "pooled":
+        if self.temporal_model == "pooled":
             # pooled模式 [B,T,H,W]
             ssim_loss = 1 - self.ssim(pred.unsqueeze(1), target.unsqueeze(1))
         else:
             # seq模式 [B,T,H,W]
-            ssim_loss = 1 - self.ssim(pred, target)
+            ssim_loss = self.ssim_loss_seq(pred, target)
         grad_loss = self.gradient_loss(pred, target)
         proj_loss = self.projection_loss(pred, target)
         return (
@@ -188,7 +237,7 @@ def train_reconstruction(
         device
     )
     # 损失函数 由于函数设计问题及满足时间聚合情况下的兼容,构建不同函数
-    criterion = ReconLoss()
+    criterion = ReconLoss(temporal_model=temporal_model).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=1e-4, weight_decay=1e-5
     )
@@ -211,7 +260,7 @@ def train_reconstruction(
     best_loss = float("inf")
     patience = 20
     no_improve = 0
-    epochs = 256  # 设置总epochs数
+    epochs = 2  #  TODO:测试epoch 2 原为256 设置总epochs数
 
     # 使用tqdm创建主进度条
 
@@ -427,7 +476,7 @@ if __name__ == "__main__":
                         file_imgs = []
 
                         for i in range(num_chunks):
-                            # 测试 小批量加载
+                            # TODO:测试 小批量加载
                             if i >= 5:
                                 break
                             start_idx = i * chunk_size

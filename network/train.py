@@ -10,6 +10,8 @@ import torch.nn.functional as F
 import h5py
 import os
 from tqdm import tqdm
+import gc
+import argparse
 
 from netmodel import NeuroImagingNet
 
@@ -303,49 +305,141 @@ def train_reconstruction(
     return model
 
 
-# 测试示例（假设已有数据）
 if __name__ == "__main__":
+
+    # 改为命令行方式
+    parser = argparse.ArgumentParser(description="重建模型训练和测试")
+    parser.add_argument(
+        "--test", action="store_true", help="测试模式，仅加载data_img0.mat数据"
+    )
+    parser.add_argument(
+        "--enhanced",
+        action="store_true",
+        default=True,
+        help="增强模式 完整注意力模式",
+    )
+    parser.add_argument(
+        "--temporal_model",
+        type=str,
+        default="pooled",
+        choices=["pooled", "seq"],
+        help="时间模型类型 (pooled/seq)",
+    )
+    parser.add_argument("--batch_size", type=int, default=32, help="批处理大小")
+    parser.add_argument(
+        "--chunk_size", type=int, default=64, help="数据分块大小"
+    )
+    args = parser.parse_args()
 
     # 加载设置
     torch.backends.cudnn.benchmark = True  # 加速卷积运算
     torch.cuda.empty_cache()  # 清空缓存
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-        "expandable_segments:True"  # 防显存碎片
-    )
-    enhanced = True  # 是否增强
-    temporal_model = "pooled"  # 是否聚合 pooled/seq
-    batch_size = 128
+    # 防显存碎片
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # 使用命令行参数替代硬编码值
+    enhanced = args.enhanced
+    temporal_model = args.temporal_model
+    batch_size = args.batch_size
+    chunk_size = args.chunk_size
 
     # 数据导入
     data_dir = "./data"  # 数据文件所在目录
     all_projections = []
     all_images = []
+    if args.test:
+        slip_data = ["data_real3.mat"]
 
     if not os.path.exists(data_dir):
         print(f"目录 {data_dir} 不存在")
     else:
         mat_files = [f for f in os.listdir(data_dir) if f.endswith(".mat")]
-
         if not mat_files:
             print(f"在 {data_dir} 中未找到.mat文件")
         else:
             mat_files.sort()  # 顺序处理
             for filename in mat_files:
+                if filename in slip_data:
+                    print(f"配置跳过文件: {filename}")
+                    continue
                 file_path = os.path.join(data_dir, filename)
                 try:
                     with h5py.File(file_path, "r") as file:
-                        # 读取并转置 projections
-                        a_projections = file["all_proj"][()]
-                        a_projections = np.transpose(a_projections, (2, 1, 0))
-                        all_projections.append(a_projections)
+                        # 数据格式
+                        print(f"正在读取文件: {filename}")
+                        print(f"文件内容: {list(file.keys())}")
 
+                        # 检查图像数据变量名
+                        img_var = None
+                        if "all_imgs" in file:
+                            img_var = "all_imgs"
+                        elif "all_ans" in file:
+                            img_var = "all_ans"
+                        else:
+                            print(
+                                f"文件 {filename} 中未找到 all_imgs 或 all_ans 键"
+                            )
+                            continue
+
+                        # 获取数据形状
+                        proj_shape = file["all_proj"].shape
+                        img_shape = file[img_var].shape
+                        num_samples = proj_shape[2]  # 第三维是样本数
+                        print(f"投影数据形状: {proj_shape}")
+                        print(f"图像数据形状: {img_shape}")
+
+                        # 分段读取 图像数据大小为[B,T,H,W]很大 mat格式中倒转
                         # 读取并转置 images
-                        a_images = file["all_imgs"][()]
-                        a_images = np.transpose(a_images, (2, 1, 0))
-                        all_images.append(a_images)
+                        # 分块读取数据
+                        num_chunks = (
+                            num_samples + chunk_size - 1
+                        ) // chunk_size
+                        print(f"分 {num_chunks} 块读取文件 {filename}")
+
+                        # 单文件数据
+                        file_proj = []
+                        file_imgs = []
+
+                        for i in range(num_chunks):
+                            start_idx = i * chunk_size
+                            end_idx = min(start_idx + chunk_size, num_samples)
+                            samples_in_chunk = end_idx - start_idx
+
+                            print(
+                                f"读取块 {i+1}/{num_chunks} (样本 {start_idx}-{end_idx})"
+                            )
+
+                            # 读取投影数据块
+                            a_proj = file["all_proj"][:, :, start_idx:end_idx]
+                            a_proj = np.transpose(a_proj, (2, 1, 0))
+                            file_proj.append(a_proj)
+
+                            # 读取图像数据块 针对pooled模式和seq模式分开
+                            if temporal_model == "pooled":
+                                a_imgs = file[img_var][:, :, start_idx:end_idx]
+                                a_imgs = np.transpose(a_imgs, (2, 1, 0))
+                            else:
+                                # seq模式
+                                a_imgs = file[img_var][
+                                    :, :, :, start_idx:end_idx
+                                ]
+                                a_imgs = np.transpose(a_imgs, (3, 2, 1, 0))
+                            file_imgs.append(a_imgs)
+
+                        # 合并文件的所有块
+                        file_proj = np.concatenate(file_proj, axis=0)
+                        file_imgs = np.concatenate(file_imgs, axis=0)
+
+                        # 合并到总数据
+                        all_projections.append(file_proj)
+                        all_images.append(file_imgs)
+
+                        # 清理临时变量
+                        del file_proj, file_imgs
+                        gc.collect()
 
                     print(
-                        f"已加载 {len(a_projections)} 个样本，来自文件 {filename}"
+                        f"已加载 {len(all_projections)} 个样本，来自文件 {filename}"
                     )
 
                 except Exception as e:

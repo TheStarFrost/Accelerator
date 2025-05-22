@@ -87,7 +87,7 @@ class ReconDataset(data.Dataset):
 
 # 复合损失函数
 class ReconLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, temporal_model="pooled"):
         super().__init__()
         self.mse = nn.MSELoss()
         self.ssim = StructuralSimilarityIndexMeasure(data_range=2.0).to(device)
@@ -96,18 +96,30 @@ class ReconLoss(nn.Module):
         ).float()
 
     def gradient_loss(self, pred, target):
-        pred_grad = F.conv2d(
-            pred.unsqueeze(1), self.grad_kernel.to(pred.device)
-        )
-        target_grad = F.conv2d(
-            target.unsqueeze(1), self.grad_kernel.to(target.device)
-        )
+        pred_grad, target_grad = None, None
+        if temporal_model == "pooled":
+            pred_grad = F.conv2d(
+                pred.unsqueeze(1), self.grad_kernel.to(pred.device)
+            )
+            target_grad = F.conv2d(
+                target.unsqueeze(1), self.grad_kernel.to(target.device)
+            )
+        else:
+            # seq模式 [B,T,H,W]
+            pred_grad = F.conv2d(pred, self.grad_kernel.to(pred.device))
+            target_grad = F.conv2d(target, self.grad_kernel.to(target.device))
         return F.l1_loss(pred_grad, target_grad)
 
     def projection_loss(self, pred, target):
         """计算x轴投影的MSE损失（自动归一化）"""
-        pred_2d = pred.unsqueeze(1)  # [B, 1, H, W]
-        target_2d = target.unsqueeze(1)
+        if temporal_model == "pooled":
+            # pooled模式 [B,T,H,W]
+            pred_2d = pred.unsqueeze(1)
+            target_2d = target.unsqueeze(1)
+        else:
+            # seq模式 [B,T,H,W]
+            pred_2d = pred
+            target_2d = target
 
         # 计算x轴投影（沿高度方向求和）
         pred_proj = pred_2d.sum(dim=2)  # 形状 [B, 1, W]
@@ -119,7 +131,12 @@ class ReconLoss(nn.Module):
 
     def forward(self, pred, target):
         mse_loss = self.mse(pred, target)
-        ssim_loss = 1 - self.ssim(pred.unsqueeze(1), target.unsqueeze(1))
+        if temporal_model == "pooled":
+            # pooled模式 [B,T,H,W]
+            ssim_loss = 1 - self.ssim(pred.unsqueeze(1), target.unsqueeze(1))
+        else:
+            # seq模式 [B,T,H,W]
+            ssim_loss = 1 - self.ssim(pred, target)
         grad_loss = self.gradient_loss(pred, target)
         proj_loss = self.projection_loss(pred, target)
         return (
@@ -138,6 +155,7 @@ def train_reconstruction(
 ):
     # 划分训练验证集
     dataset_size = len(projections)
+    print(f"数据集大小: {dataset_size}")
     # np.random.seed(88)
     indices = np.random.permutation(dataset_size)
     split = int(np.floor(val_ratio * dataset_size))
@@ -169,6 +187,7 @@ def train_reconstruction(
     model = NeuroImagingNet(enhanced=enhanced, temporal_mode=temporal_model).to(
         device
     )
+    # 损失函数 由于函数设计问题及满足时间聚合情况下的兼容,构建不同函数
     criterion = ReconLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=1e-4, weight_decay=1e-5
@@ -214,7 +233,7 @@ def train_reconstruction(
                 proj, img = proj.to(device), img.to(device)
 
                 optimizer.zero_grad()
-                output = model(proj)
+                output = model(proj)  # [B, T, H, W]
                 loss = criterion(output, img)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -310,13 +329,16 @@ if __name__ == "__main__":
     # 改为命令行方式
     parser = argparse.ArgumentParser(description="重建模型训练和测试")
     parser.add_argument(
-        "--test", action="store_true", help="测试模式，仅加载data_img0.mat数据"
+        "--test",
+        action="store_true",
+        default=False,
+        help="测试模式，仅加载data_img0.mat数据，默认非测试模式",
     )
     parser.add_argument(
         "--enhanced",
         action="store_true",
-        default=True,
-        help="增强模式 完整注意力模式",
+        default=False,
+        help="增强模式 完整注意力模式 (默认非增强模式)",
     )
     parser.add_argument(
         "--temporal_model",
@@ -338,6 +360,7 @@ if __name__ == "__main__":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # 使用命令行参数替代硬编码值
+    test_mode = args.test
     enhanced = args.enhanced
     temporal_model = args.temporal_model
     batch_size = args.batch_size
@@ -345,8 +368,8 @@ if __name__ == "__main__":
 
     # 数据导入
     data_dir = "./data"  # 数据文件所在目录
-    all_projections = []
-    all_images = []
+    projections = []
+    images = []
     slip_data = []
     if args.test:
         slip_data = ["data_real3.mat"]
@@ -404,6 +427,9 @@ if __name__ == "__main__":
                         file_imgs = []
 
                         for i in range(num_chunks):
+                            # 测试 小批量加载
+                            if i >= 5:
+                                break
                             start_idx = i * chunk_size
                             end_idx = min(start_idx + chunk_size, num_samples)
                             samples_in_chunk = end_idx - start_idx
@@ -418,11 +444,11 @@ if __name__ == "__main__":
                             file_proj.append(a_proj)
 
                             # 读取图像数据块 针对pooled模式和seq模式分开
-                            if temporal_model == "pooled":
+                            if test_mode:
                                 a_imgs = file[img_var][:, :, start_idx:end_idx]
                                 a_imgs = np.transpose(a_imgs, (2, 1, 0))
                             else:
-                                # seq模式
+                                # 全集数据格式
                                 a_imgs = file[img_var][
                                     :, :, :, start_idx:end_idx
                                 ]
@@ -434,37 +460,37 @@ if __name__ == "__main__":
                         file_imgs = np.concatenate(file_imgs, axis=0)
 
                         # 合并到总数据
-                        all_projections.append(file_proj)
-                        all_images.append(file_imgs)
+                        projections.append(file_proj)
+                        images.append(file_imgs)
 
                         # 清理临时变量
                         del file_proj, file_imgs
                         gc.collect()
 
                     print(
-                        f"已加载 {len(all_projections)} 个样本，来自文件 {filename}"
+                        f"已加载 {len(projections)} 个样本，来自文件 {filename}"
                     )
 
                 except Exception as e:
                     print(f"读取文件 {filename} 时出错: {str(e)}")
                     continue
     # 合并所有数据
-    if all_projections:
+    if projections:
         # 沿第一个维度（axis=0）合并
-        all_projections = np.concatenate(all_projections, axis=0)
-        all_images = np.concatenate(all_images, axis=0)
+        projections = np.concatenate(projections, axis=0)
+        images = np.concatenate(images, axis=0)
 
-        print("projections shape:", all_projections.shape)
-        print("images shape:", all_images.shape)
-        print(f"total samples: {len(all_projections)}")
+        print("projections shape:", projections.shape)
+        print("images shape:", images.shape)
+        print(f"total samples: {len(projections)}")
     else:
         print("no files found")
 
     # 训练
     print("Starting training...")
     trained_model = train_reconstruction(
-        all_projections,
-        all_images,
+        projections,
+        images,
         enhanced=enhanced,
         temporal_model=temporal_model,
         batch_size=batch_size,
